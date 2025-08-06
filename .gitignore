@@ -13,6 +13,9 @@ feedback/mcmc_results/*
 feedback/mcmc_results_reproduce/*
 feedback/mcmc_results_reproduce_*/*
 feedback/wandb
+gt_agents/ppo/*
+
+
 
 .DS_Store
 
