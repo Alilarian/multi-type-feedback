@@ -9,6 +9,7 @@ mutli-type-feedback/runs
 mutli-type-feedback/reward_models
 feedback/*.pth
 feedback/*.npy
+feedback/mcmc_results/*
 .DS_Store
 
 
