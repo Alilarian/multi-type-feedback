@@ -1,0 +1,4 @@
+algorithm,environment,run,seed,eval_score
+ppo,highway-v0,highway-v0_1,1377,33.712084399999995
+ppo,merge-v0,merge-v0_1,1377,12.957635400000001
+ppo,roundabout-v0,roundabout-v0_1,1377,10.125
