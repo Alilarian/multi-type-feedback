@@ -7,6 +7,7 @@ mutli-type-feedback/feedback_debug
 mutli-type-feedback/wandb
 mutli-type-feedback/runs
 mutli-type-feedback/reward_models
+feedback/*.pth
 
 .DS_Store
 
