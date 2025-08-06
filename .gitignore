@@ -8,7 +8,7 @@ mutli-type-feedback/wandb
 mutli-type-feedback/runs
 mutli-type-feedback/reward_models
 feedback/*.pth
-
+feedback/*.npy
 .DS_Store
 
 
