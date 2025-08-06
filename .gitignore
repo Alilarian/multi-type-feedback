@@ -10,6 +10,10 @@ mutli-type-feedback/reward_models
 feedback/*.pth
 feedback/*.npy
 feedback/mcmc_results/*
+feedback/mcmc_results_reproduce/*
+feedback/mcmc_results_reproduce_*/*
+feedback/wandb
+
 .DS_Store
 
 
