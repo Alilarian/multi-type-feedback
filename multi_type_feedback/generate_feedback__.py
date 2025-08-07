@@ -1,4 +1,3 @@
-import argparse
 import bisect
 import itertools
 import os
@@ -7,33 +6,25 @@ import random
 import re
 import tempfile
 import warnings
-from itertools import chain
 from pathlib import Path
-from typing import Iterator, List, Tuple, Type, Union
+from typing import List, Type, Union
 
 # necessary to import ale_py/procgen, otherwise it will not be found
-import ale_py
 import gymnasium as gym
 import numpy as np
-import pandas as pd
-import procgen
 import torch
-from gymnasium.wrappers.stateful_observation import FrameStackObservation
-from gymnasium.wrappers.transform_observation import TransformObservation
-from minigrid.wrappers import FlatObsWrapper
-from numpy.typing import NDArray
 from sklearn.cluster import MiniBatchKMeans
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.atari_wrappers import WarpFrame
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from torch import Tensor
-from multi_type_feedback.save_reset_wrapper import SaveResetEnvWrapper
+
 from multi_type_feedback.utils import TrainingUtils
 
 try:
     from train_baselines.benchmark_evals import collect_results
 except ImportError:
     collect_results = None
+
 
 def predict_expert_value(
     expert_model: Union[PPO, SAC], observation: np.ndarray, actions: Tensor = None
@@ -59,10 +50,12 @@ def predict_expert_value(
             keepdim=True,
         )[0]
 
+
 def one_hot_vector(k, max_val):
     vec = np.zeros(max_val)
     np.put(vec, k, 1)
     return vec
+
 
 def get_state_dimensions(segments):
     """Get dimensions from first state to initialize arrays."""
@@ -82,9 +75,11 @@ def get_state_dimensions(segments):
     )
     return state_dim
 
+
 def count_total_states(segments):
     """Count total number of states across all segments."""
     return sum(len(seg) for seg in segments)
+
 
 def batch_generator(segments, batch_size):
     """Generate batches of states and rewards from segments."""
@@ -113,6 +108,7 @@ def batch_generator(segments, batch_size):
     # Return any remaining states
     if current_batch_states:
         yield np.array(current_batch_states), np.array(current_batch_rewards)
+
 
 def memory_efficient_clustering(segments, n_feedback):
     """Perform memory-efficient clustering on segments."""
@@ -161,6 +157,7 @@ def memory_efficient_clustering(segments, n_feedback):
 
     return (np.array(cluster_representatives), np.array(cluster_rewards), kmeans)
 
+
 def create_segments(arr, start_indices, done_indices, segment_length):
     """
     Creates array segments with target length (segment_length) and minimum length min_segment_len,
@@ -205,8 +202,10 @@ def create_segments(arr, start_indices, done_indices, segment_length):
 
     return segments
 
+
 def discounted_sum_numpy(rewards, gamma):
     return np.sum(rewards * (gamma ** np.arange(len(rewards))))
+
 
 def equal_depth_binning_with_indices(data, num_bins):
     data = np.array(data)
@@ -230,6 +229,7 @@ def equal_depth_binning_with_indices(data, num_bins):
 
     return bin_indices, bins
 
+
 def equal_width_binning_with_indices(data, num_bins):
     data = np.array(data)
     # Find the minimum and maximum values in the data
@@ -245,6 +245,7 @@ def equal_width_binning_with_indices(data, num_bins):
     bins = [data[(bin_indices == i)] for i in range(1, num_bins + 1)]
 
     return bin_indices, bins
+
 
 def get_preference_pairs(segments, opt_gaps, n_feedback, tolerance=0.25):
     all_pairs = list(enumerate(itertools.combinations(range(len(segments)), 2)))
@@ -272,6 +273,7 @@ def get_preference_pairs(segments, opt_gaps, n_feedback, tolerance=0.25):
 
     return preferences
 
+
 def get_preference_pairs_descript(clusters, rews, n_feedback, tolerance=0.01):
     all_pairs = list(enumerate(itertools.combinations(range(len(clusters)), 2)))
     random.shuffle(all_pairs)
@@ -297,6 +299,7 @@ def get_preference_pairs_descript(clusters, rews, n_feedback, tolerance=0.01):
         )
 
     return preferences
+
 
 def debug_feedback_output(feedback_data):
     print("\nDebugging Feedback Output:")
@@ -324,77 +327,6 @@ def debug_feedback_output(feedback_data):
     print(f"Maximum segment length: {max(segment_lengths)}")
     print(f"Average segment length: {sum(segment_lengths) / len(segment_lengths):.2f}")
 
-################################################################################################  Simulating E-stop ############################################################################
-def generate_estop_feedback(
-    segments: List[List[Tuple[NDArray, NDArray, float, bool]]],
-    expert_models: List[Tuple[Union[PPO, SAC], any]],
-    n_feedback: int,
-    gamma: float,
-    beta: float = 10.0,
-    tolerance: float = 0.01
-) -> List[Tuple[int, int, int]]:
-    """
-    Generate E-stop feedback by simulating human interventions in segments.
-    
-    Args:
-        segments: List of trajectory segments, each containing (obs, action, reward, done).
-        expert_models: List of (expert_model, norm_env) pairs for value estimation.
-        n_feedback: Number of E-stop feedback instances to generate.
-        gamma: Discount factor for computing trajectory returns.
-        beta: Rationality parameter for the Bradley-Terry model.
-        tolerance: Minimum reward difference threshold for E-stop preference.
-    
-    Returns:
-        List of tuples (seg_idx, t, 1), where seg_idx is the segment index, t is the stop time,
-        and 1 indicates preference for the halted trajectory.
-    """
-    estops = []
-    sampled_indices = set()
-
-    # Shuffle segment indices to randomize selection
-    seg_indices = list(range(len(segments)))
-    random.shuffle(seg_indices)
-
-    for seg_idx in seg_indices:
-        if len(estops) >= n_feedback:
-            break
-
-        segment = segments[seg_idx]
-        if len(segment) < 2:  # Skip segments too short for meaningful E-stops
-            continue
-
-        # Compute cumulative rewards up to each time step
-        rewards = np.array([s[2] for s in segment])
-        cum_rewards = np.array([np.sum(rewards[:t+1] * (gamma ** np.arange(t+1))) for t in range(len(segment))])
-
-        # Evaluate the value of continuing vs. stopping at each time step
-        for t in range(1, len(segment)):
-            # Halted trajectory: repeat the state at t
-            halted_traj = segment[:t+1] + [(segment[t][0], segment[t][1], segment[t][2], True)] * (len(segment) - t - 1)
-            halted_rewards = np.array([s[2] for s in halted_traj])
-            halted_return = np.sum(halted_rewards * (gamma ** np.arange(len(halted_rewards))))
-
-            # Original trajectory return
-            orig_return = cum_rewards[-1] if t == len(segment) - 1 else np.sum(rewards * (gamma ** np.arange(len(rewards))))
-
-            # Use Bradley-Terry model to compute preference probability
-            rew_diff = halted_return - orig_return
-            if abs(rew_diff) > tolerance:
-                prob_halted = 1 / (1 + np.exp(-beta * rew_diff))
-                if random.random() < prob_halted:  # Simulate human choice
-                    estops.append((seg_idx, t, 1))
-                    sampled_indices.add(seg_idx)
-                    break
-
-        if len(estops) >= n_feedback:
-            break
-
-    if len(estops) < n_feedback:
-        print(f"Warning: Generated only {len(estops)} E-stop feedback instances with tolerance {tolerance}. "
-              "Consider increasing segments, lowering tolerance, or reducing n_feedback.")
-
-    return estops
-
 
 def generate_feedback(
     model_class: Type[Union[PPO, SAC]],
@@ -405,29 +337,16 @@ def generate_feedback(
     total_steps_factor: int = 50,
     n_feedback: int = 100,
     segment_len: int = 50,
-    oversampling_factor: float = 1.5,
+    oversampling_factor: int = 1.5,
     min_segment_len: int = 25,
     algorithm: str = "sac",
     device: str = "cuda",
     action_one_hot: bool = False,
     binning_type: str = "width",
-    beta_estop: float = 10.0,
-    tolerance_estop: float = 0.01
 ) -> dict:
-    """
-    Modified generate_feedback function to include E-stop feedback generation.
-    
-    Args:
-        (Existing arguments remain unchanged)
-        beta_estop: Rationality parameter for E-stop feedback.
-        tolerance_estop: Minimum reward difference for E-stop preference.
-    
-    Returns:
-        Dictionary containing feedback data, including new 'estops' key.
-    """
-    # Existing code up to segment generation remains unchanged
+    """Generate agent's observations and feedback in the training environment."""
     feedback_id = f"{algorithm}_{environment_name.replace('/', '-')}"
-    print(os.listdir(os.path.join(checkpoints_path, algorithm)))
+
     possible_checkpoint_indices = [
         str(model_dir.split("_")[-1])
         for model_dir in os.listdir(os.path.join(checkpoints_path, algorithm))
@@ -436,15 +355,19 @@ def generate_feedback(
     checkpoints_dir = os.path.join(
         checkpoints_path, algorithm, f"{environment_name.replace('/', '-')}_1"
     )
+
     print(f"Generating feedback for: {feedback_id}")
 
+    # Adaptive oversampling
     oversampling_factor = oversampling_factor
     target_n_feedback = int(n_feedback * oversampling_factor)
+
     checkpoint_files = [
         file
         for file in os.listdir(checkpoints_dir)
         if re.search(r"rl_model_.*\.zip", file)
     ] or [f"{environment_name}.zip"]
+
     total_steps = n_feedback * total_steps_factor
     num_checkpoints = len(checkpoint_files) + 1
     steps_per_checkpoint = total_steps // num_checkpoints
@@ -454,8 +377,25 @@ def generate_feedback(
     checkpoint_files = ["random"] + sorted(
         checkpoint_files, key=lambda x: int(re.search(r"\d+", x).group())
     )
+
     if action_one_hot:
-        one_hot_dim = environment.action_space.n
+        one_hot_dim = environment.action_space.n  # only works for discrete spaces
+
+    print(
+        f"""
+    Feedback Generation Debug Info:
+      Feedback ID: {feedback_id}
+      Checkpoints Directory: {checkpoints_dir}
+      Number of Checkpoints: {num_checkpoints}
+      Checkpoint Files: {checkpoint_files}
+      Total Steps: {total_steps}
+      Steps per Checkpoint: {steps_per_checkpoint}
+      Target Feedback: {n_feedback}
+      Oversampled Generated Feedback Instances: {target_n_feedback}
+      Feedback per Checkpoint: {feedback_per_checkpoint}
+      Env. Gamma: {gamma}
+    """
+    )
 
     segments = []
     state_copies = []
@@ -467,7 +407,10 @@ def generate_feedback(
         final_segment_indices = sorted(set(fb_indices))
 
         if model_file != "random":
-            model_path = checkpoints_dir.replace("_1", f"_{random.choice(possible_checkpoint_indices)}")
+            # replace the _1 index by other possible indices, this only works if all models have exactly the same number of checkpoints
+            model_path = checkpoints_dir.replace(
+                "_1", f"_{random.choice(possible_checkpoint_indices)}"
+            )
             model = model_class.load(
                 os.path.join(model_path, model_file),
                 custom_objects={"learning_rate": 0.0, "lr_schedule": lambda _: 0.0},
@@ -485,9 +428,11 @@ def generate_feedback(
             norm_env = None
 
         observation, _ = environment.reset()
+
         for step in range(steps_per_checkpoint):
             if step in final_segment_indices:
                 state_copies.append(environment.save_state(observation=observation))
+
             if model is not None:
                 action, _ = model.predict(
                     norm_env.normalize_obs(observation) if norm_env else observation,
@@ -495,12 +440,19 @@ def generate_feedback(
                 )
             else:
                 action = environment.action_space.sample()
-            next_observation, reward, terminated, truncated, _ = environment.step(action)
+
+            next_observation, reward, terminated, truncated, _ = environment.step(
+                action
+            )
             done = terminated or truncated
+
             if action_one_hot:
                 action = one_hot_vector(action, one_hot_dim)
+
             feedback.append((np.expand_dims(observation, axis=0), action, reward, done))
+
             observation = next_observation if not done else environment.reset()[0]
+
         segments.extend(
             create_segments(
                 feedback,
@@ -509,12 +461,26 @@ def generate_feedback(
                 segment_len,
             )
         )
+
         print(
             f"Generated segments: {len(segments)} of target {target_n_feedback} (Oversampling Factor: {oversampling_factor})"
         )
 
     opt_gaps = []
     for seg in segments:
+        """
+        initial_vals = [predict_expert_value(expert_model, np.array(seg[0][0])).item() for expert_model in expert_models]
+        initial_val = np.mean(initial_vals)
+        #initial_val = initial_vals[0]
+
+        discounted_rew_sum = discounted_sum_numpy([s[2] for s in seg[:-1]], gamma)
+
+        final_vals = [predict_expert_value(expert_model, np.array(seg[-1][0])).item() for expert_model in expert_models]
+        final_val = np.mean(final_vals)
+        #final_val = final_vals[0]
+
+        opt_gap = initial_val - (discounted_rew_sum + gamma ** len(seg) * final_val)
+        """
         opt_gap = -discounted_sum_numpy([s[2] for s in seg], gamma)
         opt_gaps.append(opt_gap)
 
@@ -524,17 +490,21 @@ def generate_feedback(
         if binning_type == "width"
         else equal_depth_binning_with_indices(opt_gaps, max_rating)[0]
     )
+
     print("[INFO] Successfully generated evaluative feedback")
 
     demos = []
     corrections = []
     improvements = []
+
     for i, state in enumerate(state_copies):
         current_demos = []
         current_expert_model_returns = []
+
         for exp_model_index, (expert_model, exp_norm_env) in enumerate(expert_models):
             _, _ = environment.reset()
             obs = environment.load_state(state)
+
             demo = []
             for _ in range(segment_len):
                 action, _ = expert_model.predict(
@@ -543,34 +513,44 @@ def generate_feedback(
                 )
                 new_obs, rew, terminated, truncated, _ = environment.step(action)
                 done = terminated or truncated
+
                 if action_one_hot:
                     action = one_hot_vector(action, one_hot_dim)
+
                 demo.append(
                     (np.expand_dims(obs, axis=0), action, rew, done, exp_model_index)
                 )
                 obs = new_obs
+
                 if done:
                     break
+
             current_demos.append(demo)
             current_expert_model_returns.append(
                 discounted_sum_numpy([d[2] for d in demo], gamma)
             )
+
         best_index = np.argmax(current_expert_model_returns)
         best_demo = current_demos[best_index]
         best_demo_return = current_expert_model_returns[best_index]
+
         original_return = discounted_sum_numpy([s[2] for s in segments[i]], gamma)
+
         if best_demo_return > original_return:
             demos.append(best_demo)
             corrections.append((segments[i], best_demo))
             improvements.append(best_demo_return - original_return)
         else:
+            # if the correction is worse..turn it around
             demos.append(segments[i])
             corrections.append((best_demo, segments[i]))
             improvements.append(original_return - best_demo_return)
+
         if i % 100 == 0:
             print(f"Generated demos: {len(demos)} of target {target_n_feedback}")
 
     sorted_indices = np.argsort(improvements)[::-1]
+
     final_demos = []
     final_corrections = []
     selected_indices = []
@@ -581,6 +561,7 @@ def generate_feedback(
             final_demos.append(demos[idx])
             final_corrections.append(corrections[idx])
             selected_indices.append(idx)
+
     if len(final_demos) < n_feedback:
         for idx in sorted_indices:
             if len(final_demos) >= n_feedback:
@@ -590,43 +571,38 @@ def generate_feedback(
                 final_corrections.append((segments[idx], demos[idx]))
                 selected_indices.append(idx)
 
+    # Use selected_indices to sample segments, ratings, and opt_gaps
     segments = [segments[i] for i in selected_indices]
     ratings = [ratings[i] for i in selected_indices]
     opt_gaps = [opt_gaps[i] for i in selected_indices]
+
+    # now we can sample the pairs after we have pruned segments
     tolerance = np.std(opt_gaps) / 10.0
     preferences = get_preference_pairs(
         segments, opt_gaps, n_feedback, tolerance=tolerance
     )
-    print("[INFO] Successfully generated comparative feedback")
 
-    # Generate E-stop feedback
-    estops = generate_estop_feedback(
-        segments=segments,
-        expert_models=expert_models,
-        n_feedback=n_feedback,
-        gamma=gamma,
-        beta=beta_estop,
-        tolerance=tolerance_estop
-    )
-    print("[INFO] Successfully generated E-stop feedback")
+    print("[INFO] Successfully generated comparative feedback")
 
     demos = final_demos
     corrections = final_corrections
+
     print("[INFO] Successfully generated demonstrative/corrective feedback")
 
-    demo_data = {"demos": demos, "corrections": corrections, "estops": estops}
+    demo_data = {"demos": demos, "corrections": corrections}
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp:
         pickle.dump(demo_data, tmp)
         demo_file = tmp.name
 
+    # Remove demos and corrections from memory - they'll be garbage collected
     del demos
     del corrections
-    del estops
     del demo_data
 
     cluster_representatives, cluster_rewards, kmeans = memory_efficient_clustering(
         segments=segments, n_feedback=n_feedback
     )
+
     obs_dim = np.prod(segments[0][0][0].squeeze(0).shape)
     cluster_descriptions = [
         (rep[:obs_dim], rep[obs_dim:], reward)
@@ -637,28 +613,30 @@ def generate_feedback(
         cluster_descriptions, cluster_rewards, n_feedback, tolerance=tolerance
     )
 
+    # After clustering is done, restore demos and corrections
     with open(demo_file, "rb") as f:
         demo_data = pickle.load(f)
-    os.unlink(demo_file)
+    os.unlink(demo_file)  # Clean up temporary file
 
+    # Prepare final feedback dictionary
     return {
         "segments": segments,
         "ratings": ratings,
         "preferences": preferences,
         "demos": demo_data["demos"],
         "corrections": demo_data["corrections"],
-        "estops": demo_data["estops"],
         "description": cluster_descriptions,
         "description_preference": descr_preferences,
         "opt_gaps": opt_gaps,
     }
+
 
 def main():
     parser = TrainingUtils.setup_base_parser()
     parser.add_argument(
         "--n-steps-factor",
         type=int,
-        default=20,
+        default=10,
         help="Number of steps sampled for each feedback instance",
     )
     parser.add_argument(
@@ -680,27 +658,33 @@ def main():
         "--top-n-models", type=int, default=3, help="Top N models to use"
     )
     parser.add_argument(
-        "--expert-model-base-path", type=str, default="train_baselines/gt_agents", help="Expert model base path"
-    )
-    parser.add_argument(
-        "--beta-estop", type=float, default=10.0, help="Rationality parameter for E-stop feedback"
-    )
-    parser.add_argument(
-        "--tolerance-estop", type=float, default=0.01, help="Tolerance for E-stop reward difference"
-    )
+        "--expert-model-base-path",
+        type=str,
+        default="train_baselines/gt_agents",
     args = parser.parse_args()
 
     TrainingUtils.set_seeds(args.seed)
     device = TrainingUtils.get_device()
+
     feedback_id, _ = TrainingUtils.get_model_ids(args)
     feedback_path = Path(args.save_folder) / f"{feedback_id}.pkl"
+
     environment = TrainingUtils.setup_environment(args.environment, args.seed)
 
+    # try to load most recent benchmark scores for expert models, works if experts were created via train_baselines
+    # scripts
     if collect_results is not None:
         try:
-            collect_results(args.expert_model_base_path.replace("\\","/"), [args.algorithm], str(args.expert_model_base_path))
+            collect_results(
+                args.expert_model_base_path.replace("\\", "/"),
+                [args.algorithm],
+                str(args.expert_model_base_path),
+            )
         except:
-            warnings.warn("No expert benchmark results could be found. Only random policies are available.")
+            warnings.warn(
+                """No expert benchmark results could be found. Only random policies are available. Make sure to train expert models with train_baselines,
+                          or change the path. Experts need to be trained with an SB3 MonitorWrapper and EvalCallback to retreive benchmark score"""
+            )
 
     expert_models = TrainingUtils.load_expert_models(
         args.environment,
@@ -724,392 +708,11 @@ def main():
         algorithm=args.algorithm,
         device=device,
         action_one_hot=isinstance(environment.action_space, gym.spaces.Discrete),
-        beta_estop=args.beta_estop,
-        tolerance_estop=args.tolerance_estop
     )
 
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
     with open(feedback_path, "wb") as f:
         pickle.dump(feedback, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-# def generate_feedback(
-#     model_class: Type[Union[PPO, SAC]],
-#     expert_models: List[Union[PPO, SAC]],
-#     environment: gym.Env,
-#     environment_name: str = "HalfCheetah-v5",
-#     checkpoints_path: str = "gt_agents",
-#     total_steps_factor: int = 50,
-#     n_feedback: int = 100,
-#     segment_len: int = 50,
-#     oversampling_factor: int = 1.5,
-#     min_segment_len: int = 25,
-#     algorithm: str = "sac",
-#     device: str = "cuda",
-#     action_one_hot: bool = False,
-#     binning_type: str = "width",
-# ) -> dict:
-#     """Generate agent's observations and feedback in the training environment."""
-#     feedback_id = f"{algorithm}_{environment_name.replace('/', '-')}"
-
-#     print(os.listdir(os.path.join(checkpoints_path, algorithm)))
-#     possible_checkpoint_indices = [
-#         str(model_dir.split("_")[-1])
-#         for model_dir in os.listdir(os.path.join(checkpoints_path, algorithm))
-#         if f"{environment_name.replace('/', '-')}" in model_dir
-#     ]
-#     checkpoints_dir = os.path.join(
-#         checkpoints_path, algorithm, f"{environment_name.replace('/', '-')}_1"
-#     )
-
-#     print(f"Generating feedback for: {feedback_id}")
-
-#     # Adaptive oversampling
-#     oversampling_factor = oversampling_factor
-#     target_n_feedback = int(n_feedback * oversampling_factor)
-
-#     checkpoint_files = [
-#         file
-#         for file in os.listdir(checkpoints_dir)
-#         if re.search(r"rl_model_.*\.zip", file)
-#     ] or [f"{environment_name}.zip"]
-
-#     total_steps = n_feedback * total_steps_factor
-#     num_checkpoints = len(checkpoint_files) + 1
-#     steps_per_checkpoint = total_steps // num_checkpoints
-#     feedback_per_checkpoint = target_n_feedback // num_checkpoints
-#     gamma = expert_models[0][0].gamma
-
-#     checkpoint_files = ["random"] + sorted(
-#         checkpoint_files, key=lambda x: int(re.search(r"\d+", x).group())
-#     )
-
-#     if action_one_hot:
-#         one_hot_dim = environment.action_space.n  # only works for discrete spaces
-
-#     print(
-#         f"""
-#     Feedback Generation Debug Info:
-#       Feedback ID: {feedback_id}
-#       Checkpoints Directory: {checkpoints_dir}
-#       Number of Checkpoints: {num_checkpoints}
-#       Checkpoint Files: {checkpoint_files}
-#       Total Steps: {total_steps}
-#       Steps per Checkpoint: {steps_per_checkpoint}
-#       Target Feedback: {n_feedback}
-#       Oversampled Generated Feedback Instances: {target_n_feedback}
-#       Feedback per Checkpoint: {feedback_per_checkpoint}
-#       Env. Gamma: {gamma}
-#     """
-#     )
-
-#     segments = []
-#     state_copies = []
-#     for model_file in checkpoint_files:
-#         feedback = []
-#         fb_indices = random.sample(
-#             range(steps_per_checkpoint - segment_len + 1), k=feedback_per_checkpoint + 1
-#         )
-#         final_segment_indices = sorted(set(fb_indices))
-
-#         if model_file != "random":
-#             # replace the _1 index by other possible indices, this only works if all models have exactly the same number of checkpoints
-#             model_path = checkpoints_dir.replace("_1", f"_{random.choice(possible_checkpoint_indices)}")
-#             model = model_class.load(
-#                 os.path.join(model_path, model_file),
-#                 custom_objects={"learning_rate": 0.0, "lr_schedule": lambda _: 0.0},
-#             )
-#             norm_env_path = os.path.join(
-#                 model_path, environment_name, "vecnormalize.pkl"
-#             )
-#             norm_env = (
-#                 VecNormalize.load(norm_env_path, DummyVecEnv([lambda: environment]))
-#                 if os.path.isfile(norm_env_path)
-#                 else None
-#             )
-#         else:
-#             model = None
-#             norm_env = None
-
-#         observation, _ = environment.reset()
-
-#         for step in range(steps_per_checkpoint):
-#             if step in final_segment_indices:
-#                 state_copies.append(environment.save_state(observation=observation))
-
-#             if model is not None:
-#                 action, _ = model.predict(
-#                     norm_env.normalize_obs(observation) if norm_env else observation,
-#                     deterministic=True,
-#                 )
-#             else:
-#                 action = environment.action_space.sample()
-
-#             next_observation, reward, terminated, truncated, _ = environment.step(
-#                 action
-#             )
-#             done = terminated or truncated
-
-#             if action_one_hot:
-#                 action = one_hot_vector(action, one_hot_dim)
-
-#             feedback.append((np.expand_dims(observation, axis=0), action, reward, done))
-
-#             observation = next_observation if not done else environment.reset()[0]
-
-#         segments.extend(
-#             create_segments(
-#                 feedback,
-#                 final_segment_indices,
-#                 np.where([f[3] for f in feedback])[0],
-#                 segment_len,
-#             )
-#         )
-#         print(
-#             f"Generated segments: {len(segments)} of target {target_n_feedback} (Oversampling Factor: {oversampling_factor})"
-#         )
-
-#     opt_gaps = []
-#     for seg in segments:
-#         """
-#         initial_vals = [predict_expert_value(expert_model, np.array(seg[0][0])).item() for expert_model in expert_models]
-#         initial_val = np.mean(initial_vals)
-#         #initial_val = initial_vals[0]
-
-#         discounted_rew_sum = discounted_sum_numpy([s[2] for s in seg[:-1]], gamma)
-
-#         final_vals = [predict_expert_value(expert_model, np.array(seg[-1][0])).item() for expert_model in expert_models]
-#         final_val = np.mean(final_vals)
-#         #final_val = final_vals[0]
-
-#         opt_gap = initial_val - (discounted_rew_sum + gamma ** len(seg) * final_val)
-#         """
-#         opt_gap = -discounted_sum_numpy([s[2] for s in seg], gamma)
-#         opt_gaps.append(opt_gap)
-
-#     max_rating = 10
-#     ratings = max_rating - (
-#         equal_width_binning_with_indices(opt_gaps, max_rating)[0]
-#         if binning_type == "width"
-#         else equal_depth_binning_with_indices(opt_gaps, max_rating)[0]
-#     )
-
-#     print("[INFO] Successfully generated evaluative feedback")
-
-#     demos = []
-#     corrections = []
-#     improvements = []
-
-#     for i, state in enumerate(state_copies):
-#         current_demos = []
-#         current_expert_model_returns = []
-
-#         for exp_model_index, (expert_model, exp_norm_env) in enumerate(expert_models):
-#             _, _ = environment.reset()
-#             obs = environment.load_state(state)
-
-#             demo = []
-#             for _ in range(segment_len):
-#                 action, _ = expert_model.predict(
-#                     exp_norm_env.normalize_obs(obs) if exp_norm_env else obs,
-#                     deterministic=True,
-#                 )
-#                 new_obs, rew, terminated, truncated, _ = environment.step(action)
-#                 done = terminated or truncated
-
-#                 if action_one_hot:
-#                     action = one_hot_vector(action, one_hot_dim)
-
-#                 demo.append(
-#                     (np.expand_dims(obs, axis=0), action, rew, done, exp_model_index)
-#                 )
-#                 obs = new_obs
-
-#                 if done:
-#                     break
-
-#             current_demos.append(demo)
-#             current_expert_model_returns.append(
-#                 discounted_sum_numpy([d[2] for d in demo], gamma)
-#             )
-
-#         best_index = np.argmax(current_expert_model_returns)
-#         best_demo = current_demos[best_index]
-#         best_demo_return = current_expert_model_returns[best_index]
-
-#         original_return = discounted_sum_numpy([s[2] for s in segments[i]], gamma)
-
-#         if best_demo_return > original_return:
-#             demos.append(best_demo)
-#             corrections.append((segments[i], best_demo))
-#             improvements.append(best_demo_return - original_return)
-#         else:
-#             # if the correction is worse..turn it around
-#             demos.append(segments[i])
-#             corrections.append((best_demo, segments[i]))
-#             improvements.append(original_return - best_demo_return)
-
-#         if i % 100 == 0:
-#             print(f"Generated demos: {len(demos)} of target {target_n_feedback}")
-
-#     sorted_indices = np.argsort(improvements)[::-1]
-
-#     final_demos = []
-#     final_corrections = []
-#     selected_indices = []
-#     for idx in sorted_indices:
-#         if len(final_demos) >= n_feedback:
-#             break
-#         if corrections[idx] is not None:
-#             final_demos.append(demos[idx])
-#             final_corrections.append(corrections[idx])
-#             selected_indices.append(idx)
-
-#     if len(final_demos) < n_feedback:
-#         for idx in sorted_indices:
-#             if len(final_demos) >= n_feedback:
-#                 break
-#             if idx not in selected_indices and demos[idx] is not None:
-#                 final_demos.append(demos[idx])
-#                 final_corrections.append((segments[idx], demos[idx]))
-#                 selected_indices.append(idx)
-
-#     # Use selected_indices to sample segments, ratings, and opt_gaps
-#     segments = [segments[i] for i in selected_indices]
-#     ratings = [ratings[i] for i in selected_indices]
-#     opt_gaps = [opt_gaps[i] for i in selected_indices]
-
-#     # now we can sample the pairs after we have pruned segments
-#     tolerance = np.std(opt_gaps) / 10.0
-#     preferences = get_preference_pairs(
-#         segments, opt_gaps, n_feedback, tolerance=tolerance
-#     )
-
-#     print("[INFO] Successfully generated comparative feedback")
-
-#     demos = final_demos
-#     corrections = final_corrections
-
-#     print("[INFO] Successfully generated demonstrative/corrective feedback")
-
-#     demo_data = {"demos": demos, "corrections": corrections}
-#     with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp:
-#         pickle.dump(demo_data, tmp)
-#         demo_file = tmp.name
-
-#     # Remove demos and corrections from memory - they'll be garbage collected
-#     del demos
-#     del corrections
-#     del demo_data
-
-#     cluster_representatives, cluster_rewards, kmeans = memory_efficient_clustering(
-#         segments=segments, n_feedback=n_feedback
-#     )
-
-#     obs_dim = np.prod(segments[0][0][0].squeeze(0).shape)
-#     cluster_descriptions = [
-#         (rep[:obs_dim], rep[obs_dim:], reward)
-#         for rep, reward in zip(cluster_representatives, cluster_rewards)
-#     ]
-#     tolerance = np.std(cluster_rewards) / 10.0
-#     descr_preferences = get_preference_pairs_descript(
-#         cluster_descriptions, cluster_rewards, n_feedback, tolerance=tolerance
-#     )
-
-#     # After clustering is done, restore demos and corrections
-#     with open(demo_file, "rb") as f:
-#         demo_data = pickle.load(f)
-#     os.unlink(demo_file)  # Clean up temporary file
-
-#     # Prepare final feedback dictionary
-#     return {
-#         "segments": segments,
-#         "ratings": ratings,
-#         "preferences": preferences,
-#         "demos": demo_data["demos"],
-#         "corrections": demo_data["corrections"],
-#         "description": cluster_descriptions,
-#         "description_preference": descr_preferences,
-#         "opt_gaps": opt_gaps,
-#     }
-
-# def main():
-#     parser = TrainingUtils.setup_base_parser()
-#     parser.add_argument(
-#         "--n-steps-factor",
-#         type=int,
-#         default=20,
-#         help="Number of steps sampled for each feedback instance",
-#     )
-#     parser.add_argument(
-#         "--segment-len",
-#         type=int,
-#         default=50,
-#         help="Segment length for feedback generation",
-#     )
-#     parser.add_argument(
-#         "--min-segment-len", type=int, default=None, help="Minimum segment length"
-#     )
-#     parser.add_argument(
-#         "--oversampling_factor", type=float, default=1.5, help="Oversampling factor"
-#     )
-#     parser.add_argument(
-#         "--save-folder", type=str, default="feedback", help="Save folder"
-#     )
-#     parser.add_argument(
-#         "--top-n-models", type=int, default=3, help="Top N models to use"
-#     )
-#     parser.add_argument(
-#         "--expert-model-base-path", type=str, default="train_baselines/gt_agents", help="Expert model base path"
-#     )
-#     args = parser.parse_args()
-
-#     TrainingUtils.set_seeds(args.seed)
-#     device = TrainingUtils.get_device()
-
-#     feedback_id, _ = TrainingUtils.get_model_ids(args)
-#     feedback_path = (
-#         Path(args.save_folder) / f"{feedback_id}.pkl"
-#     )
-
-#     environment = TrainingUtils.setup_environment(args.environment, args.seed)
-    
-#     # try to load most recent benchmark scores for expert models, works if experts were created via train_baselines
-#     # scripts
-#     if collect_results is not None:
-#         try:
-#             collect_results(args.expert_model_base_path.replace("\\","/"), [args.algorithm], str(args.expert_model_base_path))
-#         except:
-#             warnings.warn("""No expert benchmark results could be found. Only random policies are available. Make sure to train expert models with train_baselines,
-#                           or change the path. Experts need to be trained with an SB3 MonitorWrapper and EvalCallback to retreive benchmark score""")
-    
-#     expert_models = TrainingUtils.load_expert_models(
-#         args.environment,
-#         args.algorithm,
-#         str(args.expert_model_base_path),
-#         environment,
-#         args.top_n_models,
-#     )
-
-#     feedback = generate_feedback(
-#         model_class=PPO if args.algorithm == "ppo" else SAC,
-#         expert_models=expert_models,
-#         environment=environment,
-#         environment_name=args.environment,
-#         checkpoints_path=str(args.expert_model_base_path),
-#         total_steps_factor=args.n_steps_factor,
-#         n_feedback=args.n_feedback,
-#         segment_len=args.segment_len,
-#         oversampling_factor=args.oversampling_factor,
-#         min_segment_len=args.min_segment_len or args.segment_len // 2,
-#         algorithm=args.algorithm,
-#         device=device,
-#         action_one_hot=isinstance(environment.action_space, gym.spaces.Discrete),
-#     )
-
-#     feedback_path.parent.mkdir(parents=True, exist_ok=True)
-#     with open(feedback_path, "wb") as f:
-#         pickle.dump(feedback, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 if __name__ == "__main__":
